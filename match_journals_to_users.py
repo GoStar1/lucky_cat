@@ -1,0 +1,80 @@
+import csv
+import os
+
+os.environ.setdefault("GRPC_VERBOSITY", "NONE")
+os.environ.setdefault("GRPC_TRACE", "")
+
+from pymilvus import MilvusClient
+
+MILVUS_URI = os.getenv("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", "")
+TOP_K = int(os.getenv("TOP_K", "5"))
+QUERY_BATCH = int(os.getenv("QUERY_BATCH", "50"))
+OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "match_result.csv")
+
+
+def fetch_all_journals(client: MilvusClient) -> list[dict]:
+    results = []
+    offset = 0
+    while True:
+        batch = client.query(
+            "journals",
+            filter="",
+            output_fields=["id", "name_cn", "name_en", "embedding"],
+            limit=1000,
+            offset=offset,
+        )
+        results.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += len(batch)
+    return results
+
+
+def main():
+    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+
+    print("读取期刊向量...")
+    journals = fetch_all_journals(client)
+    print(f"共 {len(journals)} 本期刊")
+
+    output_rows = []
+
+    for i in range(0, len(journals), QUERY_BATCH):
+        batch = journals[i: i + QUERY_BATCH]
+        embeddings = [j["embedding"] for j in batch]
+
+        search_results = client.search(
+            "users",
+            data=embeddings,
+            anns_field="embedding",
+            limit=TOP_K,
+            output_fields=["id", "name", "institution", "research_direction"],
+        )
+
+        for journal, hits in zip(batch, search_results):
+            for rank, hit in enumerate(hits, start=1):
+                output_rows.append({
+                    "期刊ID": journal["id"],
+                    "期刊名称（中文）": journal["name_cn"],
+                    "期刊名称（英文）": journal["name_en"],
+                    "排名": rank,
+                    "用户邮箱": hit["entity"]["id"],
+                    "用户姓名": hit["entity"]["name"],
+                    "所在机构": hit["entity"]["institution"],
+                    "研究方向": hit["entity"]["research_direction"],
+                    "相似度": round(hit["distance"], 4),
+                })
+
+        print(f"已处理 {min(i + QUERY_BATCH, len(journals))}/{len(journals)} 本期刊")
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(output_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    print(f"完成，共 {len(output_rows)} 条匹配结果，已导出到 {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
