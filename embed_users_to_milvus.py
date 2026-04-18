@@ -1,6 +1,12 @@
 import csv
+import hashlib
+import json
 import os
+import pathlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+from dotenv import load_dotenv
+load_dotenv()
 
 os.environ.setdefault("GRPC_VERBOSITY", "NONE")
 os.environ.setdefault("GRPC_TRACE", "")
@@ -16,11 +22,12 @@ from pymilvus import (
     DataType,
 )
 
-CSV_FILE = os.path.join(os.path.dirname(__file__), "csv", "user.csv")
-MILVUS_URI = os.getenv("MILVUS_URI", "http://localhost:19530")
+CSV_FILE   = pathlib.Path(__file__).parent / "csv" / "user.csv"
+DATA_DIR   = pathlib.Path(__file__).parent / "data" / "users"
+MILVUS_URI   = os.getenv("MILVUS_URI", "http://localhost:19530")
 MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", "")
 COLLECTION_NAME = "users"
-EMBED_DIM = 1024
+EMBED_DIM  = 1024
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "128"))
 
 NEO4J_URI      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -28,78 +35,125 @@ NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
 
+# ── 文件系统工具 ────────────────────────────────────────────────────────────
+
+def user_file_path(email: str) -> pathlib.Path:
+    h = hashlib.md5(email.encode()).hexdigest()
+    return DATA_DIR / h[:2] / h[2:4] / f"{h}.json"
+
+
+def update_user_file(row: dict) -> bool:
+    """更新或创建用户文件，有变更则标记 dirty=True 并返回 True。"""
+    email = row.get("邮箱", "").strip()
+    if not email:
+        return False
+
+    path = user_file_path(email)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        user = json.loads(path.read_text(encoding="utf-8"))
+        changed = False
+    else:
+        user = {"email": email, "name": "", "institution": "", "papers": [], "dirty": False}
+        changed = True
+
+    name        = row.get("姓名", "").strip()
+    institution = row.get("机构", "").strip()
+    if not user["name"] and name:
+        user["name"] = name
+        changed = True
+    if not user["institution"] and institution:
+        user["institution"] = institution
+        changed = True
+
+    paper = {
+        "pmcid":              row.get("PMCID", "").strip(),
+        "title":              row.get("标题", "").strip(),
+        "abstract":           row.get("摘要", "").strip(),
+        "research_direction": row.get("研究方向", "").strip(),
+        "journal":            row.get("期刊", "").strip(),
+        "publication_date":   row.get("发表时间", "").strip(),
+    }
+
+    # pmcid 优先，fallback title
+    key_field = "pmcid" if paper["pmcid"] else "title"
+    key_val   = paper[key_field]
+    if key_val:
+        existing = next(
+            (i for i, p in enumerate(user["papers"]) if p.get(key_field) == key_val),
+            None,
+        )
+        if existing is not None:
+            if user["papers"][existing] != paper:
+                user["papers"][existing] = paper
+                changed = True
+        else:
+            user["papers"].append(paper)
+            changed = True
+
+    if changed:
+        user["dirty"] = True
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(user, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    return changed
+
+
+def load_dirty_users() -> list[dict]:
+    """遍历 data/users/，返回所有 dirty=True 的用户。"""
+    result = []
+    for p in DATA_DIR.rglob("*.json"):
+        try:
+            user = json.loads(p.read_text(encoding="utf-8"))
+            if user.get("dirty"):
+                result.append(user)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return result
+
+
+def mark_clean(batch_users: list[dict]):
+    """将一批用户的 dirty 置 False 并原子写回。"""
+    for user in batch_users:
+        path = user_file_path(user["email"])
+        user["dirty"] = False
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(user, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+
+# ── Embedding 工具 ──────────────────────────────────────────────────────────
+
 def _extract_one(abstract: str) -> list[str]:
-    """进程池 worker，每个进程独立初始化 extractor。"""
     extractor = yake.KeywordExtractor(lan="en", n=2, top=5, dedupLim=0.7)
     if not abstract.strip():
         return []
     return [kw for kw, _ in extractor.extract_keywords(abstract)]
 
 
-def load_csv() -> list[dict]:
-    """读取 user.csv，按邮箱去重合并；YAKE 提取并行化。"""
-    raw: dict[str, dict] = {}
-    abstract_index: list[tuple[str, str]] = []  # [(email, abstract), ...]
-
-    with open(CSV_FILE, encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            cleaned = {k.strip(): v.strip() for k, v in row.items()}
-            email = cleaned.get("邮箱", "").strip()
-            if not email:
-                continue
-
-            if email not in raw:
-                raw[email] = {
-                    "email": email,
-                    "name": cleaned.get("姓名", ""),
-                    "institution": cleaned.get("机构", ""),
-                    "research_directions": set(),
-                    "all_keywords": [],
-                }
-
-            entry = raw[email]
-            if not entry["name"] and cleaned.get("姓名"):
-                entry["name"] = cleaned["姓名"]
-            if not entry["institution"] and cleaned.get("机构"):
-                entry["institution"] = cleaned["机构"]
-
-            rd = cleaned.get("研究方向", "").strip()
-            if rd:
-                entry["research_directions"].add(rd)
-
-            abstract = cleaned.get("摘要", "").strip()
-            if abstract:
-                abstract_index.append((email, abstract))
-
-    # 并行提取关键词
-    print(f"并行提取关键词（{len(abstract_index)} 条摘要）...")
-    with ProcessPoolExecutor() as pool:
-        futures = {pool.submit(_extract_one, ab): email for email, ab in abstract_index}
-        for future in as_completed(futures):
-            email = futures[future]
-            raw[email]["all_keywords"].extend(future.result())
-
-    records = []
-    for entry in raw.values():
-        seen, seen_set = [], set()
-        for kw in entry["all_keywords"]:
-            kw_lower = kw.lower()
-            if kw_lower not in seen_set:
-                seen_set.add(kw_lower)
-                seen.append(kw)
-            if len(seen) >= 20:
-                break
-
-        records.append({
-            "email": entry["email"],
-            "name": entry["name"],
-            "institution": entry["institution"],
-            "research_direction": "; ".join(sorted(entry["research_directions"])),
-            "keywords": "; ".join(seen),
-        })
-
-    return records
+def build_user_record(user: dict, keywords: list[str]) -> dict:
+    directions = sorted({
+        p["research_direction"]
+        for p in user.get("papers", [])
+        if p.get("research_direction")
+    })
+    seen, seen_set = [], set()
+    for kw in keywords:
+        kl = kw.lower()
+        if kl not in seen_set:
+            seen_set.add(kl)
+            seen.append(kw)
+        if len(seen) >= 20:
+            break
+    return {
+        "email":              user["email"],
+        "name":               user.get("name", ""),
+        "institution":        user.get("institution", ""),
+        "research_direction": "; ".join(directions),
+        "keywords":           "; ".join(seen),
+    }
 
 
 def build_text(record: dict) -> str:
@@ -107,11 +161,12 @@ def build_text(record: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
+# ── 数据库初始化 ────────────────────────────────────────────────────────────
+
 def ensure_collection(client: MilvusClient):
     if client.has_collection(COLLECTION_NAME):
-        client.drop_collection(COLLECTION_NAME)
-        print(f"已清空旧 collection: {COLLECTION_NAME}")
-
+        print(f"collection {COLLECTION_NAME} 已存在，跳过创建")
+        return
     schema = CollectionSchema(fields=[
         FieldSchema("id", DataType.VARCHAR, max_length=256, is_primary=True),
         FieldSchema("name", DataType.VARCHAR, max_length=128),
@@ -124,18 +179,33 @@ def ensure_collection(client: MilvusClient):
     print(f"已创建 collection: {COLLECTION_NAME}")
 
 
+def ensure_index(client: MilvusClient):
+    """建索引（幂等）并加载 collection。"""
+    if "embedding" not in client.list_indexes(COLLECTION_NAME):
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="embedding",
+            metric_type="IP",
+            index_type="IVF_FLAT",
+            params={"nlist": 128},
+        )
+        client.create_index(COLLECTION_NAME, index_params)
+        print("索引已创建")
+    client.load_collection(COLLECTION_NAME)
+
+
 def ensure_neo4j(driver):
     with driver.session() as session:
-        session.run("MATCH (u:User) DETACH DELETE u")
-        print("已清空旧 User 节点")
         session.run(
             "CREATE CONSTRAINT user_email_unique IF NOT EXISTS "
             "FOR (u:User) REQUIRE u.email IS UNIQUE"
         )
-        print("已确保 User.email 唯一约束")
+    print("已确保 User.email 唯一约束")
 
 
-def insert_neo4j(session_factory, batch: list[dict]):
+# ── 写库 ─────────────────────────────────────────────────────────────────────
+
+def upsert_neo4j(session_factory, batch_records: list[dict]):
     users = [
         {
             "email":              r["email"],
@@ -144,27 +214,62 @@ def insert_neo4j(session_factory, batch: list[dict]):
             "research_direction": r["research_direction"],
             "keywords":           r["keywords"],
         }
-        for r in batch
+        for r in batch_records
     ]
     with session_factory() as session:
         session.run(
             "UNWIND $users AS u "
-            "CREATE (:User {email: u.email, name: u.name, "
-            "institution: u.institution, "
-            "research_direction: u.research_direction, "
-            "keywords: u.keywords})",
+            "MERGE (node:User {email: u.email}) "
+            "SET node.name = u.name, node.institution = u.institution, "
+            "node.research_direction = u.research_direction, node.keywords = u.keywords",
             users=users,
         )
 
+
+# ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def main():
     if not NEO4J_PASSWORD:
         raise RuntimeError("环境变量 NEO4J_PASSWORD 未设置")
 
-    print("正在读取并合并 user.csv ...")
-    records = load_csv()
-    print(f"原始记录去重后：{len(records)} 个用户")
+    # Phase A: CSV → 文件系统
+    print("正在读取 user.csv 并写入文件系统 ...")
+    updated = 0
+    with open(CSV_FILE, encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cleaned = {k.strip(): v.strip() for k, v in row.items()}
+            if update_user_file(cleaned):
+                updated += 1
+    print(f"Phase A 完成：{updated} 条记录有变更")
 
+    # Phase B: dirty → embedding → upsert
+    dirty_users = load_dirty_users()
+    print(f"需要更新的用户：{len(dirty_users)} 个")
+    if not dirty_users:
+        print("无需更新，退出。")
+        return
+
+    # 并行提取关键词
+    abstract_index: list[tuple[int, str]] = []
+    for idx, user in enumerate(dirty_users):
+        for paper in user.get("papers", []):
+            if paper.get("abstract", "").strip():
+                abstract_index.append((idx, paper["abstract"]))
+
+    print(f"并行提取关键词（{len(abstract_index)} 条摘要）...")
+    user_keywords: dict[int, list[str]] = {i: [] for i in range(len(dirty_users))}
+    with ProcessPoolExecutor() as pool:
+        futures = {pool.submit(_extract_one, ab): idx for idx, ab in abstract_index}
+        for future in as_completed(futures):
+            user_keywords[futures[future]].extend(future.result())
+
+    records = [
+        build_user_record(user, user_keywords[i])
+        for i, user in enumerate(dirty_users)
+    ]
+
+    # 连接数据库
     neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
         neo4j_driver.verify_connectivity()
@@ -177,19 +282,20 @@ def main():
         client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
         ensure_collection(client)
 
-        total_milvus = 0
-        total_neo4j  = 0
+        total = 0
 
         with ThreadPoolExecutor(max_workers=1) as milvus_pool, \
              ThreadPoolExecutor(max_workers=1) as neo4j_pool:
 
-            pending_milvus = None
-            pending_neo4j  = None
-            pending_size   = 0
+            pending_milvus      = None
+            pending_neo4j       = None
+            pending_size        = 0
+            pending_batch_users = []
 
             for i in range(0, len(records), BATCH_SIZE):
-                batch = records[i : i + BATCH_SIZE]
-                texts = [build_text(r) for r in batch]
+                batch_records = records[i : i + BATCH_SIZE]
+                batch_users   = dirty_users[i : i + BATCH_SIZE]
+                texts      = [build_text(r) for r in batch_records]
                 embeddings = model.encode(texts).tolist()
 
                 milvus_data = [
@@ -201,44 +307,36 @@ def main():
                         "keywords":           r["keywords"][:1024],
                         "embedding":          emb,
                     }
-                    for r, emb in zip(batch, embeddings)
+                    for r, emb in zip(batch_records, embeddings)
                 ]
 
+                # 等上一批完成后再 mark_clean
                 if pending_milvus is not None:
                     pending_milvus.result()
-                    total_milvus += pending_size
-                    print(f"已插入 {total_milvus}/{len(records)}")
-
                 if pending_neo4j is not None:
                     pending_neo4j.result()
-                    total_neo4j += pending_size
-                    print(f"Neo4j 已插入 {total_neo4j}/{len(records)}")
+                if pending_batch_users:
+                    mark_clean(pending_batch_users)
+                    total += pending_size
+                    print(f"已 upsert {total}/{len(records)}")
 
-                pending_milvus = milvus_pool.submit(client.insert, COLLECTION_NAME, milvus_data)
-                pending_neo4j  = neo4j_pool.submit(insert_neo4j, neo4j_driver.session, batch)
-                pending_size = len(batch)
+                pending_milvus      = milvus_pool.submit(client.upsert, COLLECTION_NAME, milvus_data)
+                pending_neo4j       = neo4j_pool.submit(upsert_neo4j, neo4j_driver.session, batch_records)
+                pending_size        = len(batch_records)
+                pending_batch_users = batch_users
 
+            # 收尾最后一批
             if pending_milvus is not None:
                 pending_milvus.result()
-                total_milvus += pending_size
-                print(f"已插入 {total_milvus}/{len(records)}")
-
             if pending_neo4j is not None:
                 pending_neo4j.result()
-                total_neo4j += pending_size
-                print(f"Neo4j 已插入 {total_neo4j}/{len(records)}")
+            if pending_batch_users:
+                mark_clean(pending_batch_users)
+                total += pending_size
+                print(f"已 upsert {total}/{len(records)}")
 
         client.flush(COLLECTION_NAME)
-
-        index_params = client.prepare_index_params()
-        index_params.add_index(
-            field_name="embedding",
-            metric_type="IP",
-            index_type="IVF_FLAT",
-            params={"nlist": 128},
-        )
-        client.create_index(COLLECTION_NAME, index_params)
-        client.load_collection(COLLECTION_NAME)
+        ensure_index(client)
 
         res = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
         print(f"完成，Milvus collection 共 {res[0]['count(*)']} 条向量")

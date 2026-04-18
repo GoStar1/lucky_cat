@@ -2,3 +2,4 @@ pymilvus>=2.3.0
 FlagEmbedding>=1.2.0
 yake
 neo4j>=5.0.0
+python-dotenv>=1.0.0

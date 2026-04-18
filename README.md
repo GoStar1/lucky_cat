@@ -1,3 +1,16 @@
+TODO：
+用户摘要信息存个文档，重复添加的时候好处理      *
+插入neo4j                                *            
+用户每次都是删除从新加，这个要改                *
+插入用户的时候去重了，这个要兼容重复邮箱用户    *
+neo4j 需要关系                          
+
+
+
+python3 embed_to_milvus.py
+python3 embed_users_to_milvus.py
+python3 match_journals_to_users.py
+
 # Lucky Cat
 
 将期刊数据与用户数据导入 Milvus 向量数据库，并根据研究方向进行智能匹配推荐。
@@ -106,8 +119,3 @@ python match_journals_to_users.py
 
 
 
-TODO：
-用户摘要信息存个文档，重复添加的时候好处理
-插入neo4j
-用户每次都是删除从新加，这个要改
-插入用户的时候去重了，这个要兼容重复邮箱用户

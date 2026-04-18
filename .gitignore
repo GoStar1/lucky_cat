@@ -85,3 +85,6 @@ Thumbs.db
 # csv
 public.csv
 user.csv
+
+# 用户文件系统数据
+data/
