@@ -8,6 +8,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import yake
 from FlagEmbedding import FlagModel
+from neo4j import GraphDatabase
 from pymilvus import (
     MilvusClient,
     CollectionSchema,
@@ -21,6 +22,10 @@ MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", "")
 COLLECTION_NAME = "users"
 EMBED_DIM = 1024
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "128"))
+
+NEO4J_URI      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
 
 def _extract_one(abstract: str) -> list[str]:
@@ -119,66 +124,132 @@ def ensure_collection(client: MilvusClient):
     print(f"已创建 collection: {COLLECTION_NAME}")
 
 
+def ensure_neo4j(driver):
+    with driver.session() as session:
+        session.run("MATCH (u:User) DETACH DELETE u")
+        print("已清空旧 User 节点")
+        session.run(
+            "CREATE CONSTRAINT user_email_unique IF NOT EXISTS "
+            "FOR (u:User) REQUIRE u.email IS UNIQUE"
+        )
+        print("已确保 User.email 唯一约束")
+
+
+def insert_neo4j(session_factory, batch: list[dict]):
+    users = [
+        {
+            "email":              r["email"],
+            "name":               r["name"],
+            "institution":        r["institution"],
+            "research_direction": r["research_direction"],
+            "keywords":           r["keywords"],
+        }
+        for r in batch
+    ]
+    with session_factory() as session:
+        session.run(
+            "UNWIND $users AS u "
+            "CREATE (:User {email: u.email, name: u.name, "
+            "institution: u.institution, "
+            "research_direction: u.research_direction, "
+            "keywords: u.keywords})",
+            users=users,
+        )
+
+
 def main():
+    if not NEO4J_PASSWORD:
+        raise RuntimeError("环境变量 NEO4J_PASSWORD 未设置")
+
     print("正在读取并合并 user.csv ...")
     records = load_csv()
     print(f"原始记录去重后：{len(records)} 个用户")
 
-    model = FlagModel("BAAI/bge-large-zh-v1.5", use_fp16=True)
-    print("模型加载完成")
+    neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        neo4j_driver.verify_connectivity()
+        print("Neo4j 连接成功")
+        ensure_neo4j(neo4j_driver)
 
-    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
-    ensure_collection(client)
+        model = FlagModel("BAAI/bge-large-zh-v1.5", use_fp16=True)
+        print("模型加载完成")
 
-    total = 0
-    # 用后台线程插入上一批，与编码下一批并行
-    with ThreadPoolExecutor(max_workers=1) as insert_pool:
-        pending = None
-        for i in range(0, len(records), BATCH_SIZE):
-            batch = records[i: i + BATCH_SIZE]
-            texts = [build_text(r) for r in batch]
-            embeddings = model.encode(texts).tolist()
+        client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+        ensure_collection(client)
 
-            data = [
-                {
-                    "id": r["email"][:256],
-                    "name": r["name"][:128],
-                    "institution": r["institution"][:512],
-                    "research_direction": r["research_direction"][:2048],
-                    "keywords": r["keywords"][:1024],
-                    "embedding": emb,
-                }
-                for r, emb in zip(batch, embeddings)
-            ]
+        total_milvus = 0
+        total_neo4j  = 0
 
-            # 等上一批插入完成，再提交新批
-            if pending is not None:
-                pending.result()
-                total += pending_size
-                print(f"已插入 {total}/{len(records)}")
+        with ThreadPoolExecutor(max_workers=1) as milvus_pool, \
+             ThreadPoolExecutor(max_workers=1) as neo4j_pool:
 
-            pending = insert_pool.submit(client.insert, COLLECTION_NAME, data)
-            pending_size = len(batch)
+            pending_milvus = None
+            pending_neo4j  = None
+            pending_size   = 0
 
-        if pending is not None:
-            pending.result()
-            total += pending_size
-            print(f"已插入 {total}/{len(records)}")
+            for i in range(0, len(records), BATCH_SIZE):
+                batch = records[i : i + BATCH_SIZE]
+                texts = [build_text(r) for r in batch]
+                embeddings = model.encode(texts).tolist()
 
-    client.flush(COLLECTION_NAME)
+                milvus_data = [
+                    {
+                        "id":                 r["email"][:256],
+                        "name":               r["name"][:128],
+                        "institution":        r["institution"][:512],
+                        "research_direction": r["research_direction"][:2048],
+                        "keywords":           r["keywords"][:1024],
+                        "embedding":          emb,
+                    }
+                    for r, emb in zip(batch, embeddings)
+                ]
 
-    index_params = client.prepare_index_params()
-    index_params.add_index(
-        field_name="embedding",
-        metric_type="IP",
-        index_type="IVF_FLAT",
-        params={"nlist": 128},
-    )
-    client.create_index(COLLECTION_NAME, index_params)
-    client.load_collection(COLLECTION_NAME)
+                if pending_milvus is not None:
+                    pending_milvus.result()
+                    total_milvus += pending_size
+                    print(f"已插入 {total_milvus}/{len(records)}")
 
-    res = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
-    print(f"完成，collection 共 {res[0]['count(*)']} 条向量")
+                if pending_neo4j is not None:
+                    pending_neo4j.result()
+                    total_neo4j += pending_size
+                    print(f"Neo4j 已插入 {total_neo4j}/{len(records)}")
+
+                pending_milvus = milvus_pool.submit(client.insert, COLLECTION_NAME, milvus_data)
+                pending_neo4j  = neo4j_pool.submit(insert_neo4j, neo4j_driver.session, batch)
+                pending_size = len(batch)
+
+            if pending_milvus is not None:
+                pending_milvus.result()
+                total_milvus += pending_size
+                print(f"已插入 {total_milvus}/{len(records)}")
+
+            if pending_neo4j is not None:
+                pending_neo4j.result()
+                total_neo4j += pending_size
+                print(f"Neo4j 已插入 {total_neo4j}/{len(records)}")
+
+        client.flush(COLLECTION_NAME)
+
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="embedding",
+            metric_type="IP",
+            index_type="IVF_FLAT",
+            params={"nlist": 128},
+        )
+        client.create_index(COLLECTION_NAME, index_params)
+        client.load_collection(COLLECTION_NAME)
+
+        res = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
+        print(f"完成，Milvus collection 共 {res[0]['count(*)']} 条向量")
+
+        with neo4j_driver.session() as session:
+            result = session.run("MATCH (u:User) RETURN count(u) AS n")
+            n = result.single()["n"]
+        print(f"完成，Neo4j 共 {n} 个 User 节点")
+
+    finally:
+        neo4j_driver.close()
 
 
 if __name__ == "__main__":
