@@ -1,11 +1,4 @@
 TODO：
-用户摘要信息存个文档，重复添加的时候好处理      *
-插入neo4j                                *            
-用户每次都是删除从新加，这个要改                *
-插入用户的时候去重了，这个要兼容重复邮箱用户    *
-neo4j 需要关系                          
-
-
 
 python3 embed_to_milvus.py
 python3 embed_users_to_milvus.py

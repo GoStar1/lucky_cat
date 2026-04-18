@@ -3,7 +3,10 @@ import hashlib
 import json
 import os
 import pathlib
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+csv.field_size_limit(sys.maxsize)
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,30 +15,24 @@ os.environ.setdefault("GRPC_VERBOSITY", "NONE")
 os.environ.setdefault("GRPC_TRACE", "")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-import yake
 from FlagEmbedding import FlagModel
 from neo4j import GraphDatabase
-from pymilvus import (
-    MilvusClient,
-    CollectionSchema,
-    FieldSchema,
-    DataType,
-)
+from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
-CSV_FILE   = pathlib.Path(__file__).parent / "csv" / "user.csv"
-DATA_DIR   = pathlib.Path(__file__).parent / "data" / "users"
-MILVUS_URI   = os.getenv("MILVUS_URI", "http://localhost:19530")
-MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", "")
+CSV_FILE        = pathlib.Path(__file__).parent / "csv" / "user.csv"
+DATA_DIR        = pathlib.Path(__file__).parent / "data" / "users"
 COLLECTION_NAME = "users"
-EMBED_DIM  = 1024
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "128"))
+EMBED_DIM       = 1024
+BATCH_SIZE      = int(os.getenv("BATCH_SIZE", "128"))
+EMBED_MODEL     = os.getenv("EMBED_MODEL", "BAAI/bge-large-zh-v1.5")
+MILVUS_URI      = os.getenv("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN    = os.getenv("MILVUS_TOKEN", "")
+NEO4J_URI       = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER      = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD  = os.getenv("NEO4J_PASSWORD")
 
-NEO4J_URI      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-
-# ── 文件系统工具 ────────────────────────────────────────────────────────────
+# ── 文件系统 ────────────────────────────────────────────────────────────────
 
 def user_file_path(email: str) -> pathlib.Path:
     h = hashlib.md5(email.encode()).hexdigest()
@@ -43,7 +40,6 @@ def user_file_path(email: str) -> pathlib.Path:
 
 
 def update_user_file(row: dict) -> bool:
-    """更新或创建用户文件，有变更则标记 dirty=True 并返回 True。"""
     email = row.get("邮箱", "").strip()
     if not email:
         return False
@@ -102,7 +98,6 @@ def update_user_file(row: dict) -> bool:
 
 
 def load_dirty_users() -> list[dict]:
-    """遍历 data/users/，返回所有 dirty=True 的用户。"""
     result = []
     for p in DATA_DIR.rglob("*.json"):
         try:
@@ -115,7 +110,6 @@ def load_dirty_users() -> list[dict]:
 
 
 def mark_clean(batch_users: list[dict]):
-    """将一批用户的 dirty 置 False 并原子写回。"""
     for user in batch_users:
         path = user_file_path(user["email"])
         user["dirty"] = False
@@ -124,63 +118,67 @@ def mark_clean(batch_users: list[dict]):
         tmp.replace(path)
 
 
-# ── Embedding 工具 ──────────────────────────────────────────────────────────
+# ── Embedding ───────────────────────────────────────────────────────────────
 
-def _extract_one(abstract: str) -> list[str]:
-    extractor = yake.KeywordExtractor(lan="en", n=2, top=5, dedupLim=0.7)
-    if not abstract.strip():
-        return []
-    return [kw for kw, _ in extractor.extract_keywords(abstract)]
-
-
-def build_user_record(user: dict, keywords: list[str]) -> dict:
+def build_user_record(user: dict) -> dict:
     directions = sorted({
         p["research_direction"]
         for p in user.get("papers", [])
         if p.get("research_direction")
     })
-    seen, seen_set = [], set()
-    for kw in keywords:
-        kl = kw.lower()
-        if kl not in seen_set:
-            seen_set.add(kl)
-            seen.append(kw)
-        if len(seen) >= 20:
-            break
     return {
         "email":              user["email"],
         "name":               user.get("name", ""),
         "institution":        user.get("institution", ""),
         "research_direction": "; ".join(directions),
-        "keywords":           "; ".join(seen),
     }
 
 
-def build_text(record: dict) -> str:
-    parts = [record.get("research_direction", ""), record.get("keywords", "")]
-    return " ".join(p for p in parts if p)
+def user_embed_texts(user: dict) -> list[str]:
+    """收集该用户的所有嵌入文本：研究方向 + 各篇摘要（每条单独嵌入后取平均）。"""
+    texts = []
+    directions = sorted({
+        p["research_direction"]
+        for p in user.get("papers", [])
+        if p.get("research_direction")
+    })
+    if directions:
+        texts.append("; ".join(directions))
+    for paper in user.get("papers", []):
+        ab = paper.get("abstract", "").strip()
+        if ab:
+            texts.append(ab)
+    return texts or [""]
 
 
 # ── 数据库初始化 ────────────────────────────────────────────────────────────
 
-def ensure_collection(client: MilvusClient):
+def ensure_collection(client: MilvusClient) -> bool:
+    """确保 collection 存在，返回是否是本次新建（新建则为空，无需 delete 旧数据）。"""
+    expected = {"id", "email", "name", "institution", "research_direction", "embedding"}
     if client.has_collection(COLLECTION_NAME):
-        print(f"collection {COLLECTION_NAME} 已存在，跳过创建")
-        return
+        info = client.describe_collection(COLLECTION_NAME)
+        actual = {f["name"] for f in info["fields"]}
+        if expected.issubset(actual):
+            print(f"collection {COLLECTION_NAME} 已存在，跳过创建")
+            client.load_collection(COLLECTION_NAME)
+            return False
+        print(f"collection {COLLECTION_NAME} 字段不匹配（paper-level 新 schema），drop 重建")
+        client.drop_collection(COLLECTION_NAME)
     schema = CollectionSchema(fields=[
-        FieldSchema("id", DataType.VARCHAR, max_length=256, is_primary=True),
-        FieldSchema("name", DataType.VARCHAR, max_length=128),
-        FieldSchema("institution", DataType.VARCHAR, max_length=512),
-        FieldSchema("research_direction", DataType.VARCHAR, max_length=2048),
-        FieldSchema("keywords", DataType.VARCHAR, max_length=1024),
-        FieldSchema("embedding", DataType.FLOAT_VECTOR, dim=EMBED_DIM),
+        FieldSchema("id",                 DataType.VARCHAR,      max_length=320, is_primary=True),
+        FieldSchema("email",              DataType.VARCHAR,      max_length=256),
+        FieldSchema("name",               DataType.VARCHAR,      max_length=128),
+        FieldSchema("institution",        DataType.VARCHAR,      max_length=512),
+        FieldSchema("research_direction", DataType.VARCHAR,      max_length=2048),
+        FieldSchema("embedding",          DataType.FLOAT_VECTOR, dim=EMBED_DIM),
     ])
     client.create_collection(COLLECTION_NAME, schema=schema)
     print(f"已创建 collection: {COLLECTION_NAME}")
+    return True
 
 
 def ensure_index(client: MilvusClient):
-    """建索引（幂等）并加载 collection。"""
     if "embedding" not in client.list_indexes(COLLECTION_NAME):
         index_params = client.prepare_index_params()
         index_params.add_index(
@@ -204,6 +202,16 @@ def ensure_neo4j(driver):
 
 # ── 写库 ─────────────────────────────────────────────────────────────────────
 
+def upsert_user_papers(client: MilvusClient, emails: list[str], entities: list[dict], skip_delete: bool = False):
+    """paper-level 写入：先按 email 删除该批用户的旧记录，再插入新记录。"""
+    if emails and not skip_delete:
+        esc = [e.replace('"', '\\"') for e in emails]
+        expr = 'email in [' + ",".join(f'"{e}"' for e in esc) + ']'
+        client.delete(COLLECTION_NAME, filter=expr)
+    if entities:
+        client.insert(COLLECTION_NAME, entities)
+
+
 def upsert_neo4j(session_factory, batch_records: list[dict], batch_users: list[dict]):
     users = [
         {
@@ -211,7 +219,6 @@ def upsert_neo4j(session_factory, batch_records: list[dict], batch_users: list[d
             "name":               r["name"],
             "institution":        r["institution"],
             "research_direction": r["research_direction"],
-            "keywords":           r["keywords"],
         }
         for r in batch_records
     ]
@@ -237,7 +244,7 @@ def upsert_neo4j(session_factory, batch_records: list[dict], batch_users: list[d
             "UNWIND $users AS u "
             "MERGE (node:User {email: u.email}) "
             "SET node.name = u.name, node.institution = u.institution, "
-            "node.research_direction = u.research_direction, node.keywords = u.keywords",
+            "node.research_direction = u.research_direction",
             users=users,
         )
         session.run(
@@ -273,10 +280,8 @@ def main():
     print("正在读取 user.csv 并写入文件系统 ...")
     updated = 0
     with open(CSV_FILE, encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            cleaned = {k.strip(): v.strip() for k, v in row.items()}
-            if update_user_file(cleaned):
+        for row in csv.DictReader(f):
+            if update_user_file({k.strip(): v.strip() for k, v in row.items()}):
                 updated += 1
     print(f"Phase A 完成：{updated} 条记录有变更")
 
@@ -287,67 +292,61 @@ def main():
         print("无需更新，退出。")
         return
 
-    # 并行提取关键词
-    abstract_index: list[tuple[int, str]] = []
-    for idx, user in enumerate(dirty_users):
-        for paper in user.get("papers", []):
-            if paper.get("abstract", "").strip():
-                abstract_index.append((idx, paper["abstract"]))
+    records = [build_user_record(u) for u in dirty_users]
 
-    print(f"并行提取关键词（{len(abstract_index)} 条摘要）...")
-    user_keywords: dict[int, list[str]] = {i: [] for i in range(len(dirty_users))}
-    with ProcessPoolExecutor() as pool:
-        futures = {pool.submit(_extract_one, ab): idx for idx, ab in abstract_index}
-        for future in as_completed(futures):
-            user_keywords[futures[future]].extend(future.result())
-
-    records = [
-        build_user_record(user, user_keywords[i])
-        for i, user in enumerate(dirty_users)
-    ]
-
-    # 连接数据库
     neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
         neo4j_driver.verify_connectivity()
         print("Neo4j 连接成功")
         ensure_neo4j(neo4j_driver)
 
-        model = FlagModel("BAAI/bge-large-zh-v1.5", use_fp16=True)
+        model = FlagModel(EMBED_MODEL, use_fp16=True)
         print("模型加载完成")
 
+        # 每条文本独立嵌入，paper-level 入库（BGE 输出已 L2 归一化）
+        text_groups = [user_embed_texts(u) for u in dirty_users]
+        flat_texts  = [t for group in text_groups for t in group]
+        print(f"编码 {len(flat_texts)} 条文本（{len(dirty_users)} 个用户）...")
+        flat_vecs = model.encode(flat_texts, batch_size=BATCH_SIZE)
+        user_offsets: list[int] = []
+        cursor = 0
+        for group in text_groups:
+            user_offsets.append(cursor)
+            cursor += len(group)
+        print("向量计算完成")
+
         client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
-        ensure_collection(client)
+        fresh_collection = ensure_collection(client)
 
         total = 0
-
         with ThreadPoolExecutor(max_workers=1) as milvus_pool, \
              ThreadPoolExecutor(max_workers=1) as neo4j_pool:
 
-            pending_milvus      = None
-            pending_neo4j       = None
-            pending_size        = 0
-            pending_batch_users = []
+            pending_milvus = pending_neo4j = None
+            pending_size, pending_batch_users = 0, []
 
             for i in range(0, len(records), BATCH_SIZE):
                 batch_records = records[i : i + BATCH_SIZE]
                 batch_users   = dirty_users[i : i + BATCH_SIZE]
-                texts      = [build_text(r) for r in batch_records]
-                embeddings = model.encode(texts).tolist()
 
-                milvus_data = [
-                    {
-                        "id":                 r["email"][:256],
-                        "name":               r["name"][:128],
-                        "institution":        r["institution"][:512],
-                        "research_direction": r["research_direction"][:2048],
-                        "keywords":           r["keywords"][:1024],
-                        "embedding":          emb,
-                    }
-                    for r, emb in zip(batch_records, embeddings)
-                ]
+                batch_emails: list[str] = []
+                milvus_data: list[dict] = []
+                for j, (user, record) in enumerate(zip(batch_users, batch_records)):
+                    user_idx = i + j
+                    start    = user_offsets[user_idx]
+                    n        = len(text_groups[user_idx])
+                    email    = user["email"]
+                    batch_emails.append(email)
+                    for k in range(n):
+                        milvus_data.append({
+                            "id":                 f"{email}#{k}"[:320],
+                            "email":              email[:256],
+                            "name":               record["name"][:128],
+                            "institution":        record["institution"][:512],
+                            "research_direction": record["research_direction"][:2048],
+                            "embedding":          flat_vecs[start + k].tolist(),
+                        })
 
-                # 等上一批完成后再 mark_clean
                 if pending_milvus is not None:
                     pending_milvus.result()
                 if pending_neo4j is not None:
@@ -355,14 +354,13 @@ def main():
                 if pending_batch_users:
                     mark_clean(pending_batch_users)
                     total += pending_size
-                    print(f"已 upsert {total}/{len(records)}")
+                    print(f"已 upsert {total}/{len(records)} 用户")
 
-                pending_milvus      = milvus_pool.submit(client.upsert, COLLECTION_NAME, milvus_data)
+                pending_milvus      = milvus_pool.submit(upsert_user_papers, client, batch_emails, milvus_data, fresh_collection)
                 pending_neo4j       = neo4j_pool.submit(upsert_neo4j, neo4j_driver.session, batch_records, batch_users)
                 pending_size        = len(batch_records)
                 pending_batch_users = batch_users
 
-            # 收尾最后一批
             if pending_milvus is not None:
                 pending_milvus.result()
             if pending_neo4j is not None:
@@ -370,18 +368,17 @@ def main():
             if pending_batch_users:
                 mark_clean(pending_batch_users)
                 total += pending_size
-                print(f"已 upsert {total}/{len(records)}")
+                print(f"已 upsert {total}/{len(records)} 用户")
 
         client.flush(COLLECTION_NAME)
         ensure_index(client)
         build_co_authored(neo4j_driver)
 
         res = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
-        print(f"完成，Milvus collection 共 {res[0]['count(*)']} 条向量")
+        print(f"完成，Milvus collection 共 {res[0]['count(*)']} 条 paper-level 向量")
 
         with neo4j_driver.session() as session:
-            result = session.run("MATCH (u:User) RETURN count(u) AS n")
-            n = result.single()["n"]
+            n = session.run("MATCH (u:User) RETURN count(u) AS n").single()["n"]
         print(f"完成，Neo4j 共 {n} 个 User 节点")
 
     finally:
