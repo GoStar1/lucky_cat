@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 csv.field_size_limit(sys.maxsize)
@@ -277,13 +278,22 @@ def main():
         raise RuntimeError("环境变量 NEO4J_PASSWORD 未设置")
 
     # Phase A: CSV → 文件系统
-    print("正在读取 user.csv 并写入文件系统 ...")
+    print("正在读取 user.csv 并写入文件系统 ...", flush=True)
     updated = 0
+    processed = 0
+    t0 = time.time()
+    next_log = t0 + 5
     with open(CSV_FILE, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             if update_user_file({k.strip(): v.strip() for k, v in row.items()}):
                 updated += 1
-    print(f"Phase A 完成：{updated} 条记录有变更")
+            processed += 1
+            now = time.time()
+            if now >= next_log:
+                rate = processed / (now - t0)
+                print(f"  已处理 {processed} 条，其中 {updated} 条有变更，速率 {rate:.0f} 行/秒", flush=True)
+                next_log = now + 5
+    print(f"Phase A 完成：共读取 {processed} 条，{updated} 条有变更，耗时 {time.time()-t0:.1f}s")
 
     # Phase B: dirty → embedding → upsert
     dirty_users = load_dirty_users()
@@ -300,8 +310,9 @@ def main():
         print("Neo4j 连接成功")
         ensure_neo4j(neo4j_driver)
 
-        model = FlagModel(EMBED_MODEL, use_fp16=True)
-        print("模型加载完成")
+        device = os.getenv("EMBED_DEVICE", "mps")
+        model = FlagModel(EMBED_MODEL, use_fp16=True, devices=device)
+        print(f"模型加载完成（device={device}）")
 
         # 每条文本独立嵌入，paper-level 入库（BGE 输出已 L2 归一化）
         text_groups = [user_embed_texts(u) for u in dirty_users]
