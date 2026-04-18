@@ -196,16 +196,15 @@ def ensure_index(client: MilvusClient):
 
 def ensure_neo4j(driver):
     with driver.session() as session:
-        session.run(
-            "CREATE CONSTRAINT user_email_unique IF NOT EXISTS "
-            "FOR (u:User) REQUIRE u.email IS UNIQUE"
-        )
-    print("已确保 User.email 唯一约束")
+        session.run("CREATE CONSTRAINT user_email_unique IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE")
+        session.run("CREATE CONSTRAINT paper_id_unique IF NOT EXISTS FOR (p:Paper) REQUIRE p.id IS UNIQUE")
+        session.run("CREATE CONSTRAINT journal_name_unique IF NOT EXISTS FOR (j:Journal) REQUIRE j.name IS UNIQUE")
+    print("Neo4j 约束已就绪")
 
 
 # ── 写库 ─────────────────────────────────────────────────────────────────────
 
-def upsert_neo4j(session_factory, batch_records: list[dict]):
+def upsert_neo4j(session_factory, batch_records: list[dict], batch_users: list[dict]):
     users = [
         {
             "email":              r["email"],
@@ -216,6 +215,23 @@ def upsert_neo4j(session_factory, batch_records: list[dict]):
         }
         for r in batch_records
     ]
+
+    paper_rows = []
+    for user in batch_users:
+        for paper in user.get("papers", []):
+            pid = paper.get("pmcid") or (
+                hashlib.md5(paper["title"].encode()).hexdigest() if paper.get("title") else None
+            )
+            if not pid:
+                continue
+            paper_rows.append({
+                "email":            user["email"],
+                "paper_id":         pid,
+                "title":            paper.get("title", ""),
+                "publication_date": paper.get("publication_date", ""),
+                "journal":          paper.get("journal", ""),
+            })
+
     with session_factory() as session:
         session.run(
             "UNWIND $users AS u "
@@ -224,6 +240,27 @@ def upsert_neo4j(session_factory, batch_records: list[dict]):
             "node.research_direction = u.research_direction, node.keywords = u.keywords",
             users=users,
         )
+        session.run(
+            "UNWIND $rows AS r "
+            "MATCH (user:User {email: r.email}) "
+            "MERGE (paper:Paper {id: r.paper_id}) "
+            "  SET paper.title = r.title, paper.publication_date = r.publication_date "
+            "MERGE (user)-[:AUTHORED]->(paper) "
+            "WITH paper, r WHERE r.journal <> '' "
+            "MERGE (journal:Journal {name: r.journal}) "
+            "MERGE (paper)-[:PUBLISHED_IN]->(journal)",
+            rows=paper_rows,
+        )
+
+
+def build_co_authored(driver):
+    with driver.session() as session:
+        session.run(
+            "MATCH (u1:User)-[:AUTHORED]->(p:Paper)<-[:AUTHORED]-(u2:User) "
+            "WHERE u1.email < u2.email "
+            "MERGE (u1)-[:CO_AUTHORED]-(u2)"
+        )
+    print("CO_AUTHORED 关系已建立")
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
@@ -321,7 +358,7 @@ def main():
                     print(f"已 upsert {total}/{len(records)}")
 
                 pending_milvus      = milvus_pool.submit(client.upsert, COLLECTION_NAME, milvus_data)
-                pending_neo4j       = neo4j_pool.submit(upsert_neo4j, neo4j_driver.session, batch_records)
+                pending_neo4j       = neo4j_pool.submit(upsert_neo4j, neo4j_driver.session, batch_records, batch_users)
                 pending_size        = len(batch_records)
                 pending_batch_users = batch_users
 
@@ -337,6 +374,7 @@ def main():
 
         client.flush(COLLECTION_NAME)
         ensure_index(client)
+        build_co_authored(neo4j_driver)
 
         res = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
         print(f"完成，Milvus collection 共 {res[0]['count(*)']} 条向量")
