@@ -31,6 +31,25 @@ MILVUS_TOKEN    = os.getenv("MILVUS_TOKEN", "")
 NEO4J_URI       = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER      = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD  = os.getenv("NEO4J_PASSWORD")
+ENABLE_KEYWORDS = os.getenv("ENABLE_KEYWORDS", "false").lower() == "true"
+KEYWORD_TOP_N   = int(os.getenv("KEYWORD_TOP_N", "20"))
+KEYWORD_NGRAM   = int(os.getenv("KEYWORD_NGRAM", "2"))
+
+if ENABLE_KEYWORDS:
+    import yake as _yake
+    _kw_extractor = _yake.KeywordExtractor(lan="zh", n=KEYWORD_NGRAM, top=KEYWORD_TOP_N)
+
+
+def _trunc(s: str, max_bytes: int) -> str:
+    b = s.encode("utf-8")
+    return b[:max_bytes].decode("utf-8", errors="ignore") if len(b) > max_bytes else s
+
+
+def extract_keywords(abstracts: list[str]) -> str:
+    if not ENABLE_KEYWORDS or not abstracts:
+        return ""
+    combined = " ".join(abstracts)
+    return ", ".join(kw for kw, _ in _kw_extractor.extract_keywords(combined))
 
 
 # ── 文件系统 ────────────────────────────────────────────────────────────────
@@ -127,16 +146,25 @@ def build_user_record(user: dict) -> dict:
         for p in user.get("papers", [])
         if p.get("research_direction")
     })
+    abstracts = [p["abstract"].strip() for p in user.get("papers", []) if p.get("abstract")]
     return {
         "email":              user["email"],
         "name":               user.get("name", ""),
         "institution":        user.get("institution", ""),
         "research_direction": "; ".join(directions),
+        "keywords":           extract_keywords(abstracts),
     }
 
 
+def _abstract_to_text(abstract: str) -> str:
+    """将摘要转换为待向量化文本：开启关键词提取时返回关键词串，否则返回原文。"""
+    if not ENABLE_KEYWORDS:
+        return abstract
+    kws = _kw_extractor.extract_keywords(abstract)
+    return ", ".join(kw for kw, _ in kws) if kws else abstract
+
+
 def user_embed_texts(user: dict) -> list[str]:
-    """收集该用户的所有嵌入文本：研究方向 + 各篇摘要（每条单独嵌入后取平均）。"""
     texts = []
     directions = sorted({
         p["research_direction"]
@@ -148,7 +176,7 @@ def user_embed_texts(user: dict) -> list[str]:
     for paper in user.get("papers", []):
         ab = paper.get("abstract", "").strip()
         if ab:
-            texts.append(ab)
+            texts.append(_abstract_to_text(ab))
     return texts or [""]
 
 
@@ -156,7 +184,7 @@ def user_embed_texts(user: dict) -> list[str]:
 
 def ensure_collection(client: MilvusClient) -> bool:
     """确保 collection 存在，返回是否是本次新建（新建则为空，无需 delete 旧数据）。"""
-    expected = {"id", "email", "name", "institution", "research_direction", "embedding"}
+    expected = {"id", "email", "name", "institution", "research_direction", "keywords", "embedding"}
     if client.has_collection(COLLECTION_NAME):
         info = client.describe_collection(COLLECTION_NAME)
         actual = {f["name"] for f in info["fields"]}
@@ -164,14 +192,15 @@ def ensure_collection(client: MilvusClient) -> bool:
             print(f"collection {COLLECTION_NAME} 已存在，跳过创建")
             client.load_collection(COLLECTION_NAME)
             return False
-        print(f"collection {COLLECTION_NAME} 字段不匹配（paper-level 新 schema），drop 重建")
+        print(f"collection {COLLECTION_NAME} 字段不匹配，drop 重建")
         client.drop_collection(COLLECTION_NAME)
     schema = CollectionSchema(fields=[
-        FieldSchema("id",                 DataType.VARCHAR,      max_length=320, is_primary=True),
+        FieldSchema("id",                 DataType.VARCHAR,      max_length=320,  is_primary=True),
         FieldSchema("email",              DataType.VARCHAR,      max_length=256),
         FieldSchema("name",               DataType.VARCHAR,      max_length=128),
-        FieldSchema("institution",        DataType.VARCHAR,      max_length=512),
+        FieldSchema("institution",        DataType.VARCHAR,      max_length=2048),
         FieldSchema("research_direction", DataType.VARCHAR,      max_length=2048),
+        FieldSchema("keywords",           DataType.VARCHAR,      max_length=2048),
         FieldSchema("embedding",          DataType.FLOAT_VECTOR, dim=EMBED_DIM),
     ])
     client.create_collection(COLLECTION_NAME, schema=schema)
@@ -315,7 +344,13 @@ def main():
         print(f"模型加载完成（device={device}）")
 
         # 每条文本独立嵌入，paper-level 入库（BGE 输出已 L2 归一化）
-        text_groups = [user_embed_texts(u) for u in dirty_users]
+        if ENABLE_KEYWORDS:
+            print(f"正在从摘要提取关键词（{len(dirty_users)} 个用户）...", flush=True)
+        text_groups = []
+        for idx, u in enumerate(dirty_users):
+            text_groups.append(user_embed_texts(u))
+            if ENABLE_KEYWORDS and (idx + 1) % 1000 == 0:
+                print(f"  关键词提取进度 {idx + 1}/{len(dirty_users)}", flush=True)
         flat_texts  = [t for group in text_groups for t in group]
         print(f"编码 {len(flat_texts)} 条文本（{len(dirty_users)} 个用户）...")
         flat_vecs = model.encode(flat_texts, batch_size=BATCH_SIZE)
@@ -352,9 +387,10 @@ def main():
                         milvus_data.append({
                             "id":                 f"{email}#{k}"[:320],
                             "email":              email[:256],
-                            "name":               record["name"][:128],
-                            "institution":        record["institution"][:512],
-                            "research_direction": record["research_direction"][:2048],
+                            "name":               _trunc(record["name"], 128),
+                            "institution":        _trunc(record["institution"], 2048),
+                            "research_direction": _trunc(record["research_direction"], 2048),
+                            "keywords":           _trunc(record["keywords"], 2048),
                             "embedding":          flat_vecs[start + k].tolist(),
                         })
 
