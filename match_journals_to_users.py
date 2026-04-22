@@ -32,7 +32,7 @@ ABSTRACT_MAX_CHARS = int(os.getenv("ABSTRACT_MAX_CHARS", "600"))
 EMAIL_THRESHOLD = float(os.getenv("EMAIL_THRESHOLD", "0.8"))
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "5"))
 
-_COMPANY_INTRO_PATH = pathlib.Path(__file__).parent / "md" / "公司简介.md"
+_COMPANY_INTRO_PATH = pathlib.Path(__file__).parent / "md" / "CompanyIntroduction.md"
 COMPANY_INTRO = _COMPANY_INTRO_PATH.read_text(encoding="utf-8") if _COMPANY_INTRO_PATH.exists() else ""
 
 _LLM_SYSTEM_PROMPT = """\
@@ -49,7 +49,7 @@ _LLM_SYSTEM_PROMPT = """\
 {"score": 0.00, "reason": "中文1-2句说明匹配或不匹配的主要原因"}
 
 重要约束：
-- reason 字段的文字中绝对不能出现英文双引号（"），引用期刊或书名时请改用书名号《》。
+- reason 字段的文字中绝对不能出现英文双引号（"），引用期刊或书名时请改用书名号《》。请写出匹配的论文题目和匹配的论文核心内容
 - 只返回 JSON 数组，不要有任何额外文字或代码块标记。\
 """
 
