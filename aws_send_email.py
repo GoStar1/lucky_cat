@@ -1,8 +1,8 @@
 import boto3
 from botocore.exceptions import ClientError
 
-AWS_ACCESS_KEY_ID = 'AKIA6IH3CGJA77WQM3HZ'
-AWS_SECRET_ACCESS_KEY = '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'
+AWS_ACCESS_KEY_ID = ''
+AWS_SECRET_ACCESS_KEY = ''
 AWS_REGION = 'ap-southeast-1'
 
 SENDER = 'info@publishing001.com'
